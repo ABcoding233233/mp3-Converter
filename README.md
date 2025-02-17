@@ -1,25 +1,28 @@
-# mp3-Converter
 # YouTube to MP3 Converter
 
-A simple command-line tool to download YouTube videos and convert them to MP3 audio format using `yt-dlp` and `FFmpeg`.
+This script downloads YouTube videos and converts them to MP3 files using [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
 ## Features
-
-- Download videos from YouTube.
-- Convert downloaded videos to MP3 format.
-- Automatically handles temporary files and cleans up after conversion.
-- Error handling for common issues during download and conversion.
+- Downloads videos and extracts audio in MP3 format.
+- Supports interactive mode (single video) and batch mode (read URLs from a file).
+- Validates YouTube URLs.
 
 ## Requirements
-
-Before running the script, ensure you have the following programs installed and available in your system's PATH:
-
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) - A command-line tool to download videos from YouTube and other sites.
-- [FFmpeg](https://ffmpeg.org/) - A powerful multimedia framework to handle video, audio, and other multimedia files and streams.
+- Python 3.6+
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed and added to your system's PATH.
 
 ## Installation
-
-1. Clone this repository:
+1. Clone the repository.
+2. Install the required dependencies.
    ```bash
-   git clone https://github.com/yourusername/yt-to-mp3-converter.git
-   cd yt-to-mp3-converter
+   pip install -r requirements.txt  # if a requirements file is provided
+   ```
+3. Ensure `yt-dlp` is installed:
+   ```bash
+   pip install yt-dlp
+   ```
+
+## Usage
+
+### Interactive Mode
+Run the script without arguments to input a YouTube URL manually:
