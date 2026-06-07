@@ -46,6 +46,7 @@ class DownloadJob:
     total: int = 0
     remaining: int = 0
     failures: int = 0
+    partials: int = 0
 
 
 @dataclass
@@ -371,7 +372,8 @@ class ConverterApp:
             # Pre-fetch playlist tracks so their rows show up before the queue
             # starts. Runs off the UI thread; falls back to a single row.
             if self._resolve_playlist_mode(url, mode):
-                self.queue_tree.set(item_id, "status", "Fetching…")
+                job.status = "Fetching"
+                self.queue_tree.set(item_id, "status", "Fetching...")
                 threading.Thread(
                     target=self._prefetch_playlist,
                     args=(item_id, url),
@@ -383,8 +385,34 @@ class ConverterApp:
 
     def _remove_selected(self):
         for item_id in self.queue_tree.selection():
-            self.jobs.pop(item_id, None)
+            if not self.queue_tree.exists(item_id):
+                continue
+
+            if item_id in self.jobs:
+                self.jobs.pop(item_id, None)
+                self.queue_tree.delete(item_id)
+                continue
+
+            parent_id = self.queue_tree.parent(item_id)
+            parent_job = self.jobs.get(parent_id)
+            if parent_job:
+                parent_job.children = {
+                    index: child
+                    for index, child in parent_job.children.items()
+                    if child[0] != item_id
+                }
+                parent_job.total = len(parent_job.children)
+
             self.queue_tree.delete(item_id)
+            if parent_job and self.queue_tree.exists(parent_id):
+                if parent_job.children:
+                    count = len(parent_job.children)
+                    self.queue_tree.set(
+                        parent_id, "status", f"Queued ({count} items)"
+                    )
+                else:
+                    self.jobs.pop(parent_id, None)
+                    self.queue_tree.delete(parent_id)
         self._set_status("Ready")
 
     def _clear_finished(self):
@@ -432,10 +460,12 @@ class ConverterApp:
         if not entries:
             # Could not enumerate the playlist; keep it as a single row and
             # let it run atomically.
+            job.status = "Queued"
             self.queue_tree.set(item_id, "status", job.status)
             return
 
         job.children.clear()
+        job.status = "Queued"
         job.playlist_title = playlist_title
         job.total = len(entries)
         for index, title, url in entries:
@@ -460,9 +490,18 @@ class ConverterApp:
             job for job in self.jobs.values() if job.status == "Queued"
         ]
         if not queued_jobs:
-            messagebox.showinfo(
-                "Queue Empty", "Add at least one queued URL first."
+            fetching = any(
+                job.status == "Fetching" for job in self.jobs.values()
             )
+            if fetching:
+                messagebox.showinfo(
+                    "Playlist Fetching",
+                    "Wait for playlist tracks to finish loading first.",
+                )
+            else:
+                messagebox.showinfo(
+                    "Queue Empty", "Add at least one queued URL first."
+                )
             return
 
         raw_output = self.output_dir_var.get().strip()
@@ -508,6 +547,7 @@ class ConverterApp:
             quality = {"source": job.source, "bitrate": job.bitrate}
             playlist_mode = self._resolve_playlist_mode(job.url, job.mode)
             job.failures = 0
+            job.partials = 0
 
             if playlist_mode and job.children:
                 job.total = job.remaining = len(job.children)
@@ -625,7 +665,7 @@ class ConverterApp:
             self._process_work_item(item, output_dir, dependencies)
 
     def _process_work_item(self, item, output_dir, dependencies):
-        self._post("row_status", item.row_id, "Downloading…")
+        self._post("row_status", item.row_id, "Downloading...")
         self._post("log", f"Starting: {item.url}")
 
         try:
@@ -766,13 +806,13 @@ class ConverterApp:
         """Turn a progress dict into a short status string for a row."""
         finished = progress["status"] == "finished"
         if progress["phase"] == "convert":
-            return "Done" if finished else "Converting…"
+            return "Done" if finished else "Converting..."
         if finished:
-            return "Converting…"
+            return "Converting..."
         percent = progress["percent"]
         if percent is not None:
             return f"Downloading {percent:.0f}%"
-        return "Downloading…"
+        return "Downloading..."
 
     def _on_item_done(self, item, return_code, saw_error):
         """Finalize one work item and roll its result into the parent job."""
@@ -802,6 +842,8 @@ class ConverterApp:
         job.remaining = max(0, job.remaining - 1)
         if status in ("Failed", "Canceled"):
             job.failures += 1
+        elif status == "Partial":
+            job.partials += 1
 
         if not self.queue_tree.exists(item.job_id):
             return
@@ -816,7 +858,7 @@ class ConverterApp:
             )
 
     def _playlist_final_status(self, job):
-        if job.failures == 0:
+        if job.failures == 0 and job.partials == 0:
             return "Done"
         if job.failures >= job.total:
             return "Failed"

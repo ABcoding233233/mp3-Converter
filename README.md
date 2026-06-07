@@ -9,6 +9,7 @@ A simple command-line tool that uses `yt-dlp` and FFmpeg to download YouTube aud
 - Supports single videos and full playlists.
 - Selectable quality: source audio (best or compact) and MP3 bitrate (320/256/192/128 kbps).
 - Desktop queue UI with live per-track progress and expandable playlist rows.
+- Known playlist tracks run in a small parallel worker pool for faster batches.
 - Playlists save directly into your chosen folder, or into a per-playlist subfolder if you ask.
 
 ## Requirements
@@ -67,7 +68,7 @@ uv run --with-requirements requirements.txt python mp3_converter_ui.py
 .\.venv\Scripts\python.exe mp3_converter_ui.py
 ```
 
-Paste one or more YouTube links, choose Auto, Single, or Playlist mode, pick the **Source** and **Bitrate** quality, select an output folder, then start the queue. Each row shows live progress; playlists expand into one row per track, each with its own progress, and the playlist row shows an overall `45% (3/12)` summary. Tick **Playlist subfolder** to group a playlist's tracks into a folder named after the playlist (off by default — tracks go straight into the chosen folder).
+Paste one or more YouTube links, choose Auto, Single, or Playlist mode, pick the **Source** and **Bitrate** quality, select an output folder, then start the queue. Each row shows live progress; playlists expand into one row per track, each with its own progress, and the playlist row shows an overall `45% (3/12)` summary. When the app can fetch the playlist track list first, it processes up to three tracks at once. Tick **Playlist subfolder** to group a playlist's tracks into a folder named after the playlist (off by default - tracks go straight into the chosen folder).
 
 ### Command Line
 

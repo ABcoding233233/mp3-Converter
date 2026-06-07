@@ -399,7 +399,10 @@ def fetch_playlist_entries(source_url, dependencies):
         "--flat-playlist",
         "--no-warnings",
         "--print",
-        "%(playlist_index)s\t%(title)s\t%(url)s\t%(playlist_title)s",
+        (
+            "%(playlist_index)s\t%(title)s\t%(webpage_url)s\t%(url)s\t"
+            "%(playlist_title)s"
+        ),
         source_url,
     ]
 
@@ -424,7 +427,7 @@ def parse_flat_playlist_output(text):
     playlist_title = ""
     for line in text.splitlines():
         parts = line.split("\t")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
 
         index = _parse_index(parts[0])
@@ -432,12 +435,23 @@ def parse_flat_playlist_output(text):
             continue
 
         title = parts[1].strip() or f"Item {index}"
-        url = parts[2].strip()
-        if len(parts) >= 4 and parts[3].strip():
-            playlist_title = parts[3].strip()
+        url = _first_real_value(parts[2], parts[3])
+        if not url:
+            continue
+        if len(parts) >= 5 and parts[4].strip():
+            playlist_title = parts[4].strip()
         entries.append((index, title, url))
 
     return entries, playlist_title
+
+
+def _first_real_value(*values):
+    """Return the first non-empty yt-dlp value that is not the NA sentinel."""
+    for value in values:
+        value = value.strip()
+        if value and value != "NA":
+            return value
+    return ""
 
 
 def utf8_subprocess_env():

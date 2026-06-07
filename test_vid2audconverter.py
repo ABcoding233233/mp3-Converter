@@ -10,10 +10,14 @@ from pathlib import Path
 
 from vid2audconverter import (
     SOURCE_FORMATS,
+    build_item_command,
     build_yt_dlp_command,
+    get_item_output_template,
     get_output_template,
     looks_like_playlist,
     parse_progress_line,
+    parse_flat_playlist_output,
+    sanitize_filename,
 )
 
 
@@ -126,6 +130,34 @@ def test_quality_overrides_source_and_bitrate():
     assert SOURCE_FORMATS["compact"] in command
 
 
+def test_item_command_uses_no_playlist_and_literal_index_prefix():
+    command = build_item_command(
+        "https://youtu.be/abc",
+        Path("/music"),
+        dependencies=FAKE_DEPS,
+        quality={"source": "compact", "bitrate": 192},
+        index=7,
+    )
+    output = command[command.index("-o") + 1]
+    assert "--no-playlist" in command
+    assert "--yes-playlist" not in command
+    assert "007 - %(title)s.%(ext)s" in output
+    assert command[command.index("--audio-quality") + 1] == "192K"
+    assert command[-1] == "https://youtu.be/abc"
+
+
+def test_item_template_sanitizes_playlist_subfolder():
+    template = get_item_output_template(
+        Path("/music"), index=3, playlist_title='Bad:Name*? '
+    )
+    assert "Bad_Name__" in template
+    assert template.endswith("003 - %(title)s.%(ext)s")
+
+
+def test_sanitize_filename_falls_back_for_empty_names():
+    assert sanitize_filename(" . ") == "playlist"
+
+
 def test_parse_progress_download_with_index():
     line = "@@PROG@@\tdownload\t3\t 45.2%\tdownloading"
     result = parse_progress_line(line)
@@ -148,3 +180,23 @@ def test_parse_progress_convert_finished_single_video():
 def test_parse_progress_ignores_normal_log_lines():
     assert parse_progress_line("[download] Destination: song.webm") is None
     assert parse_progress_line("ERROR: video unavailable") is None
+
+
+def test_parse_flat_playlist_output_prefers_webpage_url():
+    text = (
+        "1\tFirst Song\thttps://youtu.be/abc\tabc\tMix Name\n"
+        "2\tSecond Song\thttps://youtu.be/def\tdef\tMix Name\n"
+    )
+    entries, playlist_title = parse_flat_playlist_output(text)
+    assert playlist_title == "Mix Name"
+    assert entries == [
+        (1, "First Song", "https://youtu.be/abc"),
+        (2, "Second Song", "https://youtu.be/def"),
+    ]
+
+
+def test_parse_flat_playlist_output_falls_back_to_raw_url():
+    text = "4\tFourth Song\tNA\thttps://youtu.be/four\tPlaylist\n"
+    entries, playlist_title = parse_flat_playlist_output(text)
+    assert playlist_title == "Playlist"
+    assert entries == [(4, "Fourth Song", "https://youtu.be/four")]
