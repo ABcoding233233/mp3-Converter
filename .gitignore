@@ -5,7 +5,14 @@ __pycache__/
 *.py[cod]
 
 *.mp3
+*.mp4
 *.m4a
 *.webm
 *.part
 *.ytdl
+
+.DS_Store
+Thumbs.db
+*.tmp.*
+
+.claude/

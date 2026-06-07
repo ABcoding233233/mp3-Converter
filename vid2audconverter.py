@@ -1,5 +1,7 @@
 import argparse
 import importlib.util
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -7,25 +9,121 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-AUDIO_ONLY_FORMAT = "bestaudio[acodec!=none]/bestaudio"
+# yt-dlp format selectors for the two source-quality choices.
+SOURCE_FORMATS = {
+    "best": "bestaudio[acodec!=none]/bestaudio",
+    "compact": (
+        "bestaudio[abr<=128][acodec!=none]/"
+        "worstaudio[acodec!=none]/bestaudio"
+    ),
+}
+BITRATE_CHOICES = [320, 256, 192, 128]
+DEFAULT_QUALITY = {"source": "best", "bitrate": 320}
+
+# Prefix that marks the progress lines emitted by --progress-template so the
+# UI can tell them apart from normal yt-dlp output.
+PROGRESS_SENTINEL = "@@PROG@@"
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+def main():
+    args = parse_args()
+    print("Welcome to YouTube to MP3 Converter!")
+
+    try:
+        dependencies = check_dependencies()
+    except OSError as error:
+        sys.exit(f"Environment error: {error}")
+
+    source_url = args.url or input("Enter the YouTube URL: ").strip()
+    if not source_url:
+        sys.exit("No URL provided. Please try again.")
+
+    playlist_mode = resolve_playlist_mode(args, source_url)
+    output_dir = resolve_output_dir(args)
+
+    if playlist_mode:
+        print("Playlist mode enabled.")
+    else:
+        print("Single-video mode enabled.")
+        print("Use --playlist to force playlist downloads.")
+
+    quality = {"source": args.source, "bitrate": args.bitrate}
+
+    try:
+        download_audio_as_mp3(
+            source_url=source_url,
+            output_dir=output_dir,
+            playlist_mode=playlist_mode,
+            dependencies=dependencies,
+            playlist_subfolder=args.subfolder,
+            quality=quality,
+        )
+    except subprocess.CalledProcessError as error:
+        sys.exit(f"yt-dlp failed with exit code {error.returncode}.")
+
+
+def parse_args():
+    """Parse command-line arguments for the CLI."""
+    parser = argparse.ArgumentParser(
+        description="Download YouTube audio as MP3 without downloading video."
+    )
+    parser.add_argument(
+        "url", nargs="?", help="YouTube video or playlist URL."
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        help="Directory for the MP3 files. Defaults to this script's folder.",
+    )
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--playlist",
+        action="store_true",
+        help="Download every item in a playlist URL.",
+    )
+    mode.add_argument(
+        "--single",
+        action="store_true",
+        help="Download only the single video, even if the URL has a playlist.",
+    )
+
+    parser.add_argument(
+        "--subfolder",
+        action="store_true",
+        help="Save a playlist into a subfolder named after the playlist.",
+    )
+    parser.add_argument(
+        "--bitrate",
+        type=int,
+        choices=BITRATE_CHOICES,
+        default=DEFAULT_QUALITY["bitrate"],
+        help="MP3 bitrate in kbps (default: 320).",
+    )
+    parser.add_argument(
+        "--source",
+        choices=list(SOURCE_FORMATS),
+        default=DEFAULT_QUALITY["source"],
+        help="Source audio: 'best' quality or 'compact' smaller download.",
+    )
+
+    return parser.parse_args()
 
 
 def check_dependencies():
-    """Check if required Python packages and executables are available."""
-    missing_programs = []
-
+    """Return the yt-dlp command and FFmpeg path, or raise if missing."""
     if importlib.util.find_spec("yt_dlp") is None:
-        missing_programs.append("yt-dlp")
-
-    if missing_programs:
-        raise EnvironmentError(
-            f"Required Python packages not found: {', '.join(missing_programs)}\n"
-            "Install them with: uv pip install -r requirements.txt"
+        raise OSError(
+            "Required package yt-dlp was not found.\n"
+            "Install it with: uv pip install -r requirements.txt"
         )
 
     ffmpeg_location = shutil.which("ffmpeg") or get_bundled_ffmpeg()
     if not ffmpeg_location:
-        raise EnvironmentError(
+        raise OSError(
             "FFmpeg was not found in PATH and the bundled imageio-ffmpeg "
             "fallback is unavailable.\n"
             "Install dependencies with: uv pip install -r requirements.txt"
@@ -38,7 +136,7 @@ def check_dependencies():
 
 
 def get_bundled_ffmpeg():
-    """Return the imageio-ffmpeg executable path when available."""
+    """Return the imageio-ffmpeg executable path when available, else None."""
     if importlib.util.find_spec("imageio_ffmpeg") is None:
         return None
 
@@ -54,30 +152,87 @@ def get_bundled_ffmpeg():
     return None
 
 
+def resolve_playlist_mode(args, source_url):
+    """Decide playlist vs single mode from the flags, else from the URL."""
+    if args.playlist:
+        return True
+    if args.single:
+        return False
+    return looks_like_playlist(source_url)
+
+
+def resolve_output_dir(args):
+    """Return the output directory, defaulting to this script's folder."""
+    if args.output_dir:
+        return Path(args.output_dir).expanduser().resolve()
+    return Path(__file__).resolve().parent
+
+
 def looks_like_playlist(source_url):
-    """Return True when the URL has common YouTube playlist markers."""
+    """Return True when the URL points at a playlist, not a single video.
+
+    A bare playlist URL (``/playlist?list=...``) is always treated as a
+    playlist. A normal watch URL that merely carries a ``list=`` parameter
+    (autoplay/radio links, "watch?v=...&list=...") is treated as a single video
+    so Auto mode does not unexpectedly download an entire playlist. Use
+    ``--playlist`` to force playlist mode for those URLs.
+    """
     parsed = urlparse(source_url)
     query = parse_qs(parsed.query)
 
-    return "list" in query or parsed.path.rstrip("/").endswith("/playlist")
+    if parsed.path.rstrip("/").endswith("/playlist"):
+        return True
+
+    # A watch URL carries a video id (``v=`` on youtube.com, or the path on
+    # youtu.be short links). Those are single videos even when a list= is set.
+    has_video_id = "v" in query or parsed.netloc.endswith("youtu.be")
+    return "list" in query and not has_video_id
 
 
-def get_output_template(output_dir, playlist_mode):
-    """Build a yt-dlp output template for single videos or playlists."""
-    if playlist_mode:
-        return str(
-            output_dir
-            / "%(playlist_title)s"
-            / "%(playlist_index)03d - %(title)s.%(ext)s"
-        )
-
-    return str(output_dir / "%(title)s.%(ext)s")
-
-
-def download_audio_as_mp3(source_url, output_dir, playlist_mode, dependencies):
+def download_audio_as_mp3(
+    source_url,
+    output_dir,
+    playlist_mode,
+    dependencies,
+    playlist_subfolder=False,
+    quality=None,
+):
     """Download audio-only media with yt-dlp and convert it to MP3."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_template = get_output_template(output_dir, playlist_mode)
+    command = build_yt_dlp_command(
+        source_url=source_url,
+        output_dir=output_dir,
+        playlist_mode=playlist_mode,
+        dependencies=dependencies,
+        playlist_subfolder=playlist_subfolder,
+        quality=quality,
+    )
+
+    mode = "playlist" if playlist_mode else "single video"
+    print(f"Downloading {mode} audio and converting to MP3...")
+    print(f"Output folder: {output_dir}")
+
+    subprocess.run(command, check=True, env=utf8_subprocess_env())
+
+    print(f"Done. MP3 file(s) saved under: {output_dir}")
+
+
+def build_yt_dlp_command(
+    source_url,
+    output_dir,
+    playlist_mode,
+    dependencies,
+    playlist_subfolder=False,
+    quality=None,
+):
+    """Build the yt-dlp command used by both the CLI and desktop UI."""
+    quality = quality or DEFAULT_QUALITY
+    audio_format = SOURCE_FORMATS.get(
+        quality["source"], SOURCE_FORMATS["best"]
+    )
+    output_template = get_output_template(
+        output_dir, playlist_mode, playlist_subfolder
+    )
 
     command = list(dependencies["yt_dlp_command"])
     if playlist_mode:
@@ -88,13 +243,27 @@ def download_audio_as_mp3(source_url, output_dir, playlist_mode, dependencies):
     command.extend(
         [
             "-f",
-            AUDIO_ONLY_FORMAT,
+            audio_format,
             "-x",
             "--audio-format",
             "mp3",
             "--audio-quality",
-            "2",
+            f"{quality['bitrate']}K",
             "--embed-metadata",
+            "--newline",
+            "--color",
+            "never",
+            "--progress-template",
+            (
+                f"download:{PROGRESS_SENTINEL}\tdownload\t"
+                "%(info.playlist_index)s\t%(progress._percent_str)s\t"
+                "%(progress.status)s"
+            ),
+            "--progress-template",
+            (
+                f"postprocess:{PROGRESS_SENTINEL}\tconvert\t"
+                "%(info.playlist_index)s\t-\t%(progress.status)s"
+            ),
             "--ffmpeg-location",
             dependencies["ffmpeg_location"],
             "--continue",
@@ -104,88 +273,112 @@ def download_audio_as_mp3(source_url, output_dir, playlist_mode, dependencies):
         ]
     )
 
-    mode = "playlist" if playlist_mode else "single video"
-    print(f"Downloading {mode} audio and converting to MP3...")
-    print(f"Output folder: {output_dir}")
-
-    subprocess.run(command, check=True)
-
-    print(f"Done. MP3 file(s) saved under: {output_dir}")
+    return command
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Download YouTube audio as MP3 without downloading video streams."
-    )
-    parser.add_argument("url", nargs="?", help="YouTube video or playlist URL.")
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        help="Directory where MP3 files should be saved. Defaults to this script's folder.",
-    )
+def get_output_template(output_dir, playlist_mode, playlist_subfolder=False):
+    """Build a yt-dlp output template for single videos or playlists.
 
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--playlist",
-        action="store_true",
-        help="Download every item in a playlist URL.",
-    )
-    mode.add_argument(
-        "--single",
-        action="store_true",
-        help="Download only the single video, even if the URL contains playlist data.",
-    )
+    Playlists land directly in ``output_dir`` unless ``playlist_subfolder`` is
+    set, in which case they go into a subfolder named after the playlist.
+    """
+    if not playlist_mode:
+        return str(output_dir / "%(title)s.%(ext)s")
 
-    return parser.parse_args()
+    filename = "%(playlist_index)03d - %(title)s.%(ext)s"
+    if playlist_subfolder:
+        return str(output_dir / "%(playlist_title)s" / filename)
+    return str(output_dir / filename)
 
 
-def main():
-    print("Welcome to YouTube to MP3 Converter!")
+def parse_progress_line(line):
+    """Parse a yt-dlp --progress-template line into a dict, else return None.
+
+    Normal log lines (anything not prefixed with PROGRESS_SENTINEL) return
+    None. A parsed line looks like::
+
+        {"phase": "download"|"convert", "index": int|None,
+         "percent": float|None, "status": "downloading"|"finished"|...}
+
+    ``index`` is the 1-based playlist position, or None for a single video.
+    """
+    line = _ANSI_RE.sub("", line)
+    if not line.startswith(PROGRESS_SENTINEL):
+        return None
+
+    parts = line.split("\t")
+    if len(parts) < 5:
+        return None
+
+    _, phase, index_raw, percent_raw, status = parts[:5]
+    return {
+        "phase": phase,
+        "index": _parse_index(index_raw),
+        "percent": _parse_percent(percent_raw),
+        "status": status.strip(),
+    }
+
+
+def _parse_index(raw):
+    """Return a 1-based playlist index, or None when there isn't one."""
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
+def _parse_percent(raw):
+    """Return a float percentage from a string like ' 45.2%', else None."""
+    match = _PERCENT_RE.search(raw)
+    return float(match.group(1)) if match else None
+
+
+def fetch_playlist_entries(source_url, dependencies):
+    """Return a list of (index, title) for a playlist URL, or [] on failure.
+
+    Uses a fast --flat-playlist metadata pass (no downloads) so the UI can show
+    every track before the queue starts.
+    """
+    command = list(dependencies["yt_dlp_command"]) + [
+        "--flat-playlist",
+        "--no-warnings",
+        "--print",
+        "%(playlist_index)s\t%(title)s",
+        source_url,
+    ]
 
     try:
-        args = parse_args()
-        dependencies = check_dependencies()
-
-        source_url = args.url or input("Enter the YouTube URL: ").strip()
-        if not source_url:
-            print("Invalid URL. Please try again.")
-            return
-
-        if args.playlist:
-            playlist_mode = True
-        elif args.single:
-            playlist_mode = False
-        else:
-            playlist_mode = looks_like_playlist(source_url)
-
-        script_dir = Path(__file__).resolve().parent
-        output_dir = (
-            Path(args.output_dir).expanduser().resolve()
-            if args.output_dir
-            else script_dir
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=utf8_subprocess_env(),
         )
+    except Exception:
+        return []
 
-        if playlist_mode:
-            print("Playlist mode enabled.")
-        else:
-            print("Single-video mode enabled. Use --playlist to force playlist downloads.")
+    entries = []
+    for line in result.stdout.splitlines():
+        index_raw, _, title = line.partition("\t")
+        index = _parse_index(index_raw)
+        if index is not None:
+            entries.append((index, title.strip() or f"Item {index}"))
 
-        download_audio_as_mp3(
-            source_url=source_url,
-            output_dir=output_dir,
-            playlist_mode=playlist_mode,
-            dependencies=dependencies,
-        )
+    return entries
 
-    except FileNotFoundError as e:
-        print(f"File Error: {e}")
-    except EnvironmentError as e:
-        print(f"Environment Error: {e}")
-    except subprocess.CalledProcessError as e:
-        print(f"yt-dlp failed with exit code {e.returncode}.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        print("Full error details:", str(sys.exc_info()))
+
+def utf8_subprocess_env():
+    """Return an environment that forces UTF-8 I/O for the yt-dlp subprocess.
+
+    Without this, video titles containing non-ASCII characters can raise
+    UnicodeEncodeError on legacy Windows consoles (cp1252).
+    """
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 if __name__ == "__main__":
