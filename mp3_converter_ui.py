@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from vid2audconverter import (
+    build_item_command,
     build_yt_dlp_command,
     check_dependencies,
     fetch_playlist_entries,
@@ -16,6 +17,10 @@ from vid2audconverter import (
     utf8_subprocess_env,
 )
 
+
+# How many items download/convert at once. 2-3 overlaps a download with the
+# previous item's conversion without hammering the connection.
+MAX_WORKERS = 3
 
 # Map the friendly dropdown labels to the core quality values.
 SOURCE_LABELS = {"Best audio": "best", "Compact": "compact"}
@@ -35,9 +40,24 @@ class DownloadJob:
     source: str
     bitrate: int
     status: str = "Queued"
-    children: dict = field(default_factory=dict)  # playlist_index -> row iid
+    # playlist_index -> (row iid, item url)
+    children: dict = field(default_factory=dict)
+    playlist_title: str = ""
     total: int = 0
-    done_indices: set = field(default_factory=set)
+    remaining: int = 0
+    failures: int = 0
+
+
+@dataclass
+class WorkItem:
+    job_id: str
+    row_id: str
+    url: str
+    quality: dict
+    kind: str = "single"  # "single" | "item" | "playlist_atomic"
+    index: int = None
+    playlist_title: str = ""
+    subfolder: bool = False
 
 
 class ConverterApp:
@@ -51,7 +71,7 @@ class ConverterApp:
         self.job_counter = 0
         self.events = queue.Queue()
         self.stop_requested = threading.Event()
-        self.current_process = None
+        self.active_processes = set()
         self.process_lock = threading.Lock()
         self.worker_thread = None
         self._dependencies = None
@@ -397,14 +417,13 @@ class ConverterApp:
     def _prefetch_playlist(self, item_id, url):
         """Fetch a playlist's track list off the UI thread (background)."""
         dependencies = self._get_dependencies()
-        entries = (
-            fetch_playlist_entries(url, dependencies)
-            if dependencies is not None
-            else []
-        )
-        self._post("prefetch_done", item_id, entries)
+        if dependencies is not None:
+            entries, playlist_title = fetch_playlist_entries(url, dependencies)
+        else:
+            entries, playlist_title = [], ""
+        self._post("prefetch_done", item_id, entries, playlist_title)
 
-    def _add_playlist_children(self, item_id, entries):
+    def _add_playlist_children(self, item_id, entries, playlist_title):
         """Populate a playlist job's child rows (runs on the UI thread)."""
         job = self.jobs.get(item_id)
         if not job or not self.queue_tree.exists(item_id):
@@ -412,15 +431,16 @@ class ConverterApp:
 
         if not entries:
             # Could not enumerate the playlist; keep it as a single row and
-            # let it expand lazily when it runs.
+            # let it run atomically.
             self.queue_tree.set(item_id, "status", job.status)
             return
 
         job.children.clear()
+        job.playlist_title = playlist_title
         job.total = len(entries)
-        for index, title in entries:
+        for index, title, url in entries:
             child_id = f"{item_id}_item_{index}"
-            job.children[index] = child_id
+            job.children[index] = (child_id, url)
             if self.queue_tree.exists(child_id):
                 self.queue_tree.delete(child_id)
             self.queue_tree.insert(
@@ -466,22 +486,81 @@ class ConverterApp:
         self.output_dir_var.set(str(output_dir))
 
         playlist_subfolder = self.subfolder_var.get()
+        work_items = self._build_work_items(queued_jobs, playlist_subfolder)
+
         self.stop_requested.clear()
         self._set_running(True)
         self.worker_thread = threading.Thread(
-            target=self._worker,
-            args=(queued_jobs, output_dir, playlist_subfolder),
+            target=self._run_pool,
+            args=(work_items, output_dir),
             daemon=True,
         )
         self.worker_thread.start()
 
+    def _build_work_items(self, queued_jobs, playlist_subfolder):
+        """Flatten queued jobs into individual download work items.
+
+        A playlist with known tracks becomes one work item per track (so they
+        can run in parallel); otherwise the job is a single work item.
+        """
+        work_items = []
+        for job in queued_jobs:
+            quality = {"source": job.source, "bitrate": job.bitrate}
+            playlist_mode = self._resolve_playlist_mode(job.url, job.mode)
+            job.failures = 0
+
+            if playlist_mode and job.children:
+                job.total = job.remaining = len(job.children)
+                title = job.playlist_title if playlist_subfolder else ""
+                for index in sorted(job.children):
+                    child_id, url = job.children[index]
+                    work_items.append(
+                        WorkItem(
+                            job_id=job.item_id,
+                            row_id=child_id,
+                            url=url,
+                            quality=quality,
+                            kind="item",
+                            index=index,
+                            playlist_title=title,
+                        )
+                    )
+            elif playlist_mode:
+                job.total = job.remaining = 1
+                work_items.append(
+                    WorkItem(
+                        job_id=job.item_id,
+                        row_id=job.item_id,
+                        url=job.url,
+                        quality=quality,
+                        kind="playlist_atomic",
+                        subfolder=playlist_subfolder,
+                    )
+                )
+            else:
+                job.total = job.remaining = 1
+                work_items.append(
+                    WorkItem(
+                        job_id=job.item_id,
+                        row_id=job.item_id,
+                        url=job.url,
+                        quality=quality,
+                        kind="single",
+                    )
+                )
+        return work_items
+
     def _stop_queue(self):
         self.stop_requested.set()
-        with self.process_lock:
-            process = self.current_process
-        if process and process.poll() is None:
-            process.terminate()
+        self._terminate_active_processes()
         self._set_status("Stopping...")
+
+    def _terminate_active_processes(self):
+        with self.process_lock:
+            processes = list(self.active_processes)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
 
     def _on_close(self):
         running = self.worker_thread and self.worker_thread.is_alive()
@@ -493,14 +572,12 @@ class ConverterApp:
             if not should_close:
                 return
             self.stop_requested.set()
-            with self.process_lock:
-                process = self.current_process
-            if process and process.poll() is None:
-                process.terminate()
+            self._terminate_active_processes()
 
         self.root.destroy()
 
-    def _worker(self, queued_jobs, output_dir, playlist_subfolder):
+    def _run_pool(self, work_items, output_dir):
+        """Manager thread: run work items through a pool of N workers."""
         dependencies = self._get_dependencies()
         if dependencies is None:
             self._post("log", "Setup error: yt-dlp or FFmpeg is missing.")
@@ -508,59 +585,79 @@ class ConverterApp:
             self._post("running", False)
             return
 
-        for job in queued_jobs:
-            if self.stop_requested.is_set():
-                break
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self._post("log", f"Setup error: {exc}")
+            self._post("statusbar", "Setup error")
+            self._post("running", False)
+            return
 
-            item_id = job.item_id
-            playlist_mode = self._resolve_playlist_mode(job.url, job.mode)
-            resolved_mode = "Playlist" if playlist_mode else "Single"
-            quality = {"source": job.source, "bitrate": job.bitrate}
-            self._post("job_status", item_id, "Running")
-            self._post("log", "")
-            self._post("log", f"Starting {resolved_mode.lower()}: {job.url}")
-            self._post("statusbar", f"Running {resolved_mode.lower()}")
+        work_queue = queue.Queue()
+        for item in work_items:
+            work_queue.put(item)
 
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                command = build_yt_dlp_command(
-                    source_url=job.url,
-                    output_dir=output_dir,
-                    playlist_mode=playlist_mode,
-                    dependencies=dependencies,
-                    playlist_subfolder=playlist_subfolder,
-                    quality=quality,
-                )
-                return_code, saw_error = self._run_process(command, item_id)
-            except Exception as exc:
-                self._post("job_status", item_id, "Failed")
-                self._post("log", f"Failed: {exc}")
-                continue
+        self._post("statusbar", "Running")
+        worker_count = min(MAX_WORKERS, len(work_items)) or 1
+        threads = []
+        for _ in range(worker_count):
+            thread = threading.Thread(
+                target=self._pool_worker,
+                args=(work_queue, output_dir, dependencies),
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
 
-            if self.stop_requested.is_set():
-                self._post("job_status", item_id, "Canceled")
-                self._post("log", "Canceled.")
-                break
-
-            if return_code != 0:
-                self._post("job_status", item_id, "Failed")
-                self._post("log", f"yt-dlp exited with code {return_code}.")
-            elif saw_error:
-                # Playlist mode uses --ignore-errors, so yt-dlp can exit 0 even
-                # when some items failed. Flag that the job finished partially.
-                self._post("job_status", item_id, "Partial")
-                self._post(
-                    "log", "Done, but some items failed (see log above)."
-                )
-            else:
-                self._post("job_status", item_id, "Done")
-                self._post("log", "Done.")
+        for thread in threads:
+            thread.join()
 
         final_status = "Stopped" if self.stop_requested.is_set() else "Ready"
         self._post("statusbar", final_status)
         self._post("running", False)
 
-    def _run_process(self, command, item_id):
+    def _pool_worker(self, work_queue, output_dir, dependencies):
+        while not self.stop_requested.is_set():
+            try:
+                item = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._process_work_item(item, output_dir, dependencies)
+
+    def _process_work_item(self, item, output_dir, dependencies):
+        self._post("row_status", item.row_id, "Downloading…")
+        self._post("log", f"Starting: {item.url}")
+
+        try:
+            command = self._build_item_command(item, output_dir, dependencies)
+            return_code, saw_error = self._run_process(command, item.row_id)
+        except Exception as exc:
+            self._post("log", f"Failed: {item.url}: {exc}")
+            self._post("item_done", item, -1, False)
+            return
+
+        self._post("item_done", item, return_code, saw_error)
+
+    def _build_item_command(self, item, output_dir, dependencies):
+        if item.kind == "playlist_atomic":
+            return build_yt_dlp_command(
+                source_url=item.url,
+                output_dir=output_dir,
+                playlist_mode=True,
+                dependencies=dependencies,
+                playlist_subfolder=item.subfolder,
+                quality=item.quality,
+            )
+        return build_item_command(
+            item.url,
+            output_dir,
+            dependencies,
+            quality=item.quality,
+            index=item.index,
+            playlist_title=item.playlist_title or None,
+        )
+
+    def _run_process(self, command, row_id):
         startupinfo = None
         if sys.platform.startswith("win"):
             startupinfo = subprocess.STARTUPINFO()
@@ -578,7 +675,7 @@ class ConverterApp:
             env=utf8_subprocess_env(),
         )
         with self.process_lock:
-            self.current_process = process
+            self.active_processes.add(process)
 
         saw_error = False
         try:
@@ -588,7 +685,7 @@ class ConverterApp:
                     if clean_line:
                         progress = parse_progress_line(clean_line)
                         if progress is not None:
-                            self._post("progress", item_id, progress)
+                            self._post("progress", row_id, progress)
                         else:
                             if clean_line.startswith("ERROR"):
                                 saw_error = True
@@ -599,7 +696,7 @@ class ConverterApp:
             return process.wait(), saw_error
         finally:
             with self.process_lock:
-                self.current_process = None
+                self.active_processes.discard(process)
 
     def _resolve_playlist_mode(self, url, mode):
         if mode == "playlist":
@@ -627,16 +724,20 @@ class ConverterApp:
 
             if event_type == "log":
                 self._append_log(payload[0])
-            elif event_type == "job_status":
-                self._set_job_status(payload[0], payload[1])
+            elif event_type == "row_status":
+                self._set_row_status(payload[0], payload[1])
             elif event_type == "statusbar":
                 self._set_status(payload[0])
             elif event_type == "running":
                 self._set_running(payload[0])
             elif event_type == "progress":
                 self._update_progress(payload[0], payload[1])
+            elif event_type == "item_done":
+                self._on_item_done(payload[0], payload[1], payload[2])
             elif event_type == "prefetch_done":
-                self._add_playlist_children(payload[0], payload[1])
+                self._add_playlist_children(
+                    payload[0], payload[1], payload[2]
+                )
 
         self.root.after(100, self._drain_events)
 
@@ -646,33 +747,20 @@ class ConverterApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _set_job_status(self, item_id, status):
-        job = self.jobs.get(item_id)
-        if not job:
-            return
+    def _set_row_status(self, row_id, status):
+        """Set a row's Status text; if the row is a job, track job.status too."""
+        job = self.jobs.get(row_id)
+        if job:
+            job.status = status
+        if self.queue_tree.exists(row_id):
+            self.queue_tree.set(row_id, "status", status)
 
-        job.status = status
-        if self.queue_tree.exists(item_id):
-            self.queue_tree.set(item_id, "status", status)
-
-    def _update_progress(self, item_id, progress):
-        """Apply a parsed yt-dlp progress update to the matching tree row."""
-        job = self.jobs.get(item_id)
-        if not job:
-            return
-
-        index = progress["index"]
-        label = self._progress_label(progress)
-
-        # Route to the child row when the playlist index is known, otherwise
-        # update the job's own (single-video) row.
-        if index is not None and index in job.children:
-            row_id = job.children[index]
-            if self.queue_tree.exists(row_id):
-                self.queue_tree.set(row_id, "status", label)
-            self._update_parent_aggregate(job, progress)
-        elif self.queue_tree.exists(item_id) and not job.children:
-            self.queue_tree.set(item_id, "status", label)
+    def _update_progress(self, row_id, progress):
+        """Show a live progress label on the row that produced it."""
+        if self.queue_tree.exists(row_id):
+            self.queue_tree.set(
+                row_id, "status", self._progress_label(progress)
+            )
 
     def _progress_label(self, progress):
         """Turn a progress dict into a short status string for a row."""
@@ -686,20 +774,53 @@ class ConverterApp:
             return f"Downloading {percent:.0f}%"
         return "Downloading…"
 
-    def _update_parent_aggregate(self, job, progress):
-        """Refresh a playlist row's '<pct>% (done/total)' summary."""
-        if progress["phase"] == "convert" and progress["status"] == "finished":
-            index = progress["index"]
-            if index is not None:
-                job.done_indices.add(index)
+    def _on_item_done(self, item, return_code, saw_error):
+        """Finalize one work item and roll its result into the parent job."""
+        canceled = self.stop_requested.is_set() and return_code != 0
+        if canceled:
+            status = "Canceled"
+        elif return_code != 0:
+            status = "Failed"
+        elif saw_error:
+            status = "Partial"
+        else:
+            status = "Done"
 
-        total = job.total or len(job.children)
-        completed = len(job.done_indices)
-        pct = int(completed / total * 100) if total else 0
-        if self.queue_tree.exists(job.item_id):
+        if self.queue_tree.exists(item.row_id):
+            self.queue_tree.set(item.row_id, "status", status)
+
+        job = self.jobs.get(item.job_id)
+        if not job:
+            return
+
+        if item.row_id == item.job_id:
+            # Single video or atomic playlist: the row is the job itself.
+            job.status = status
+            return
+
+        # A playlist track finished: update counts and the parent summary.
+        job.remaining = max(0, job.remaining - 1)
+        if status in ("Failed", "Canceled"):
+            job.failures += 1
+
+        if not self.queue_tree.exists(item.job_id):
+            return
+        if job.remaining == 0:
+            job.status = self._playlist_final_status(job)
+            self.queue_tree.set(item.job_id, "status", job.status)
+        else:
+            completed = job.total - job.remaining
+            pct = int(completed / job.total * 100) if job.total else 0
             self.queue_tree.set(
-                job.item_id, "status", f"{pct}% ({completed}/{total})"
+                item.job_id, "status", f"{pct}% ({completed}/{job.total})"
             )
+
+    def _playlist_final_status(self, job):
+        if job.failures == 0:
+            return "Done"
+        if job.failures >= job.total:
+            return "Failed"
+        return "Partial"
 
     def _set_status(self, status):
         self.status_var.set(status)

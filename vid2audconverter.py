@@ -24,8 +24,20 @@ DEFAULT_QUALITY = {"source": "best", "bitrate": 320}
 # UI can tell them apart from normal yt-dlp output.
 PROGRESS_SENTINEL = "@@PROG@@"
 
+DOWNLOAD_PROGRESS_TEMPLATE = (
+    f"download:{PROGRESS_SENTINEL}\tdownload\t"
+    "%(info.playlist_index)s\t%(progress._percent_str)s\t"
+    "%(progress.status)s"
+)
+CONVERT_PROGRESS_TEMPLATE = (
+    f"postprocess:{PROGRESS_SENTINEL}\tconvert\t"
+    "%(info.playlist_index)s\t-\t%(progress.status)s"
+)
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)")
+# Characters that are not allowed in Windows file/folder names.
+_INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def main():
@@ -240,40 +252,62 @@ def build_yt_dlp_command(
     else:
         command.append("--no-playlist")
 
-    command.extend(
-        [
-            "-f",
-            audio_format,
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            f"{quality['bitrate']}K",
-            "--embed-metadata",
-            "--newline",
-            "--color",
-            "never",
-            "--progress-template",
-            (
-                f"download:{PROGRESS_SENTINEL}\tdownload\t"
-                "%(info.playlist_index)s\t%(progress._percent_str)s\t"
-                "%(progress.status)s"
-            ),
-            "--progress-template",
-            (
-                f"postprocess:{PROGRESS_SENTINEL}\tconvert\t"
-                "%(info.playlist_index)s\t-\t%(progress.status)s"
-            ),
-            "--ffmpeg-location",
-            dependencies["ffmpeg_location"],
-            "--continue",
-            "-o",
-            output_template,
-            source_url,
-        ]
+    command.extend(_conversion_flags(audio_format, quality, dependencies))
+    command.extend(["-o", output_template, source_url])
+    return command
+
+
+def build_item_command(
+    item_url,
+    output_dir,
+    dependencies,
+    quality=None,
+    index=None,
+    playlist_title=None,
+):
+    """Build a yt-dlp command that downloads+converts ONE video to MP3.
+
+    Used by the desktop UI to run playlist tracks individually (in parallel).
+    ``index`` prefixes the filename ("003 - Title.mp3") and ``playlist_title``,
+    when given, nests the file in a subfolder of that (sanitized) name.
+    """
+    quality = quality or DEFAULT_QUALITY
+    audio_format = SOURCE_FORMATS.get(
+        quality["source"], SOURCE_FORMATS["best"]
+    )
+    output_template = get_item_output_template(
+        output_dir, index, playlist_title
     )
 
+    command = list(dependencies["yt_dlp_command"])
+    command.append("--no-playlist")
+    command.extend(_conversion_flags(audio_format, quality, dependencies))
+    command.extend(["-o", output_template, item_url])
     return command
+
+
+def _conversion_flags(audio_format, quality, dependencies):
+    """Return the shared yt-dlp flags for audio-only download + MP3 convert."""
+    return [
+        "-f",
+        audio_format,
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        f"{quality['bitrate']}K",
+        "--embed-metadata",
+        "--newline",
+        "--color",
+        "never",
+        "--progress-template",
+        DOWNLOAD_PROGRESS_TEMPLATE,
+        "--progress-template",
+        CONVERT_PROGRESS_TEMPLATE,
+        "--ffmpeg-location",
+        dependencies["ffmpeg_location"],
+        "--continue",
+    ]
 
 
 def get_output_template(output_dir, playlist_mode, playlist_subfolder=False):
@@ -289,6 +323,27 @@ def get_output_template(output_dir, playlist_mode, playlist_subfolder=False):
     if playlist_subfolder:
         return str(output_dir / "%(playlist_title)s" / filename)
     return str(output_dir / filename)
+
+
+def get_item_output_template(output_dir, index=None, playlist_title=None):
+    """Output template for a single item downloaded with --no-playlist.
+
+    The index (when known) is baked into the name as a literal prefix because
+    --no-playlist means yt-dlp cannot fill %(playlist_index)s itself.
+    """
+    target_dir = output_dir
+    if playlist_title:
+        target_dir = output_dir / sanitize_filename(playlist_title)
+
+    if index is not None:
+        return str(target_dir / f"{index:03d} - %(title)s.%(ext)s")
+    return str(target_dir / "%(title)s.%(ext)s")
+
+
+def sanitize_filename(name):
+    """Strip characters that are illegal in Windows file/folder names."""
+    cleaned = _INVALID_FILENAME_RE.sub("_", name).strip().rstrip(". ")
+    return cleaned or "playlist"
 
 
 def parse_progress_line(line):
@@ -334,16 +389,17 @@ def _parse_percent(raw):
 
 
 def fetch_playlist_entries(source_url, dependencies):
-    """Return a list of (index, title) for a playlist URL, or [] on failure.
+    """Return ``(entries, playlist_title)`` for a playlist URL.
 
-    Uses a fast --flat-playlist metadata pass (no downloads) so the UI can show
-    every track before the queue starts.
+    ``entries`` is a list of ``(index, title, url)`` tuples; both are empty on
+    failure. Uses a fast --flat-playlist metadata pass (no downloads) so the UI
+    can show every track and download them individually.
     """
     command = list(dependencies["yt_dlp_command"]) + [
         "--flat-playlist",
         "--no-warnings",
         "--print",
-        "%(playlist_index)s\t%(title)s",
+        "%(playlist_index)s\t%(title)s\t%(url)s\t%(playlist_title)s",
         source_url,
     ]
 
@@ -357,16 +413,31 @@ def fetch_playlist_entries(source_url, dependencies):
             env=utf8_subprocess_env(),
         )
     except Exception:
-        return []
+        return [], ""
 
+    return parse_flat_playlist_output(result.stdout)
+
+
+def parse_flat_playlist_output(text):
+    """Parse --flat-playlist --print output into (entries, playlist_title)."""
     entries = []
-    for line in result.stdout.splitlines():
-        index_raw, _, title = line.partition("\t")
-        index = _parse_index(index_raw)
-        if index is not None:
-            entries.append((index, title.strip() or f"Item {index}"))
+    playlist_title = ""
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
 
-    return entries
+        index = _parse_index(parts[0])
+        if index is None:
+            continue
+
+        title = parts[1].strip() or f"Item {index}"
+        url = parts[2].strip()
+        if len(parts) >= 4 and parts[3].strip():
+            playlist_title = parts[3].strip()
+        entries.append((index, title, url))
+
+    return entries, playlist_title
 
 
 def utf8_subprocess_env():
