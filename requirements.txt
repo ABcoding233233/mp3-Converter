@@ -1,0 +1,5 @@
+imageio-ffmpeg
+yt-dlp
+
+# If a system FFmpeg is available in PATH, the script will use it. Otherwise,
+# imageio-ffmpeg provides a bundled FFmpeg executable for yt-dlp conversion.

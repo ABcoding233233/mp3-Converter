@@ -1,191 +1,192 @@
-import subprocess
-import os
+import argparse
+import importlib.util
 import shutil
+import subprocess
 import sys
-import tempfile
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+
+AUDIO_ONLY_FORMAT = "bestaudio[acodec!=none]/bestaudio"
+
 
 def check_dependencies():
-    """Check if required programs are available in PATH."""
+    """Check if required Python packages and executables are available."""
     missing_programs = []
-    for program in ["yt-dlp", "ffmpeg"]:
-        if not shutil.which(program):
-            missing_programs.append(program)
-    
+
+    if importlib.util.find_spec("yt_dlp") is None:
+        missing_programs.append("yt-dlp")
+
     if missing_programs:
         raise EnvironmentError(
-            f"Required programs not found in PATH: {', '.join(missing_programs)}\n"
-            "Please ensure they are installed and added to your system's PATH."
+            f"Required Python packages not found: {', '.join(missing_programs)}\n"
+            "Install them with: uv pip install -r requirements.txt"
         )
 
-def get_video_title(youtube_url):
-    """Extract the video title from the YouTube URL using yt-dlp."""
+    ffmpeg_location = shutil.which("ffmpeg") or get_bundled_ffmpeg()
+    if not ffmpeg_location:
+        raise EnvironmentError(
+            "FFmpeg was not found in PATH and the bundled imageio-ffmpeg "
+            "fallback is unavailable.\n"
+            "Install dependencies with: uv pip install -r requirements.txt"
+        )
+
+    return {
+        "yt_dlp_command": [sys.executable, "-m", "yt_dlp"],
+        "ffmpeg_location": ffmpeg_location,
+    }
+
+
+def get_bundled_ffmpeg():
+    """Return the imageio-ffmpeg executable path when available."""
+    if importlib.util.find_spec("imageio_ffmpeg") is None:
+        return None
+
     try:
-        yt_dlp_path = shutil.which("yt-dlp")
-        result = subprocess.run(
-            [yt_dlp_path, "--get-title", youtube_url],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        title = result.stdout.strip()
-        # Remove invalid characters for filenames
-        valid_chars = "-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        title = "".join(c for c in title if c in valid_chars)
-        return title
-    except subprocess.CalledProcessError as e:
-        print(f"Error fetching video title: {e.stderr}")
-        return "video"  # Fallback to a default name
+        from imageio_ffmpeg import get_ffmpeg_exe
+    except Exception:
+        return None
 
-def download_video(youtube_url, output_video):
-    """Download video using yt-dlp."""
-    try:
-        print(f"Downloading video to: {output_video}")
-        yt_dlp_path = shutil.which("yt-dlp")
+    ffmpeg_path = Path(get_ffmpeg_exe())
+    if ffmpeg_path.exists():
+        return str(ffmpeg_path)
 
-        # Generate a temp path without creating the file
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, f"temp_video_{os.getpid()}.%(ext)s")
+    return None
 
-        result = subprocess.run(
-            [
-                yt_dlp_path,
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                "--remux-video", "mp4",
-                "-o", temp_file_path,
-                youtube_url
-            ],
-            check=True,
-            capture_output=True,
-            text=True
+
+def looks_like_playlist(source_url):
+    """Return True when the URL has common YouTube playlist markers."""
+    parsed = urlparse(source_url)
+    query = parse_qs(parsed.query)
+
+    return "list" in query or parsed.path.rstrip("/").endswith("/playlist")
+
+
+def get_output_template(output_dir, playlist_mode):
+    """Build a yt-dlp output template for single videos or playlists."""
+    if playlist_mode:
+        return str(
+            output_dir
+            / "%(playlist_title)s"
+            / "%(playlist_index)03d - %(title)s.%(ext)s"
         )
 
-        # Find the actual downloaded file
-        downloaded_files = [f for f in os.listdir(temp_dir) if f.startswith(f"temp_video_{os.getpid()}")]
-        if not downloaded_files:
-            raise FileNotFoundError("Downloaded file not found in temp directory")
-        
-        temp_file_path = os.path.join(temp_dir, downloaded_files[0])
-        shutil.move(temp_file_path, output_video)
+    return str(output_dir / "%(title)s.%(ext)s")
 
-        if os.path.exists(output_video):
-            print("Video downloaded successfully.")
-        else:
-            print("Error: Video file not created after download.")
-            print("yt-dlp output:", result.stdout)
-            print("yt-dlp error output:", result.stderr)
-            raise FileNotFoundError("Downloaded video file not found")
 
-    except subprocess.CalledProcessError as e:
-        print(f"Error downloading video: {e.stderr}")
-        print("yt-dlp output:", e.stdout)
-        raise
-    except Exception as e:
-        print(f"An unexpected error occurred: {str(e)}")
-        raise
+def download_audio_as_mp3(source_url, output_dir, playlist_mode, dependencies):
+    """Download audio-only media with yt-dlp and convert it to MP3."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_template = get_output_template(output_dir, playlist_mode)
 
-def is_video_valid(video_file):
-    """Check if the video file is valid using FFmpeg."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", video_file, "-f", "null", "-"],
-            capture_output=True,
-            text=True
-        )
-        return result.returncode == 0
-    except Exception as e:
-        print(f"Error validating video: {str(e)}")
-        return False
+    command = list(dependencies["yt_dlp_command"])
+    if playlist_mode:
+        command.extend(["--yes-playlist", "--ignore-errors"])
+    else:
+        command.append("--no-playlist")
 
-def convert_to_mp3(input_video, output_audio):
-    """Convert video to MP3 using FFmpeg."""
-    try:
-        if not os.path.exists(input_video):
-            raise FileNotFoundError(f"Input video file not found: {input_video}")
-        
-        print(f"Converting video to MP3...")
-        print(f"Input file: {input_video}")
-        print(f"Output file: {output_audio}")
-        
-        ffmpeg_path = shutil.which("ffmpeg")
-        result = subprocess.run(
-            [
-                ffmpeg_path,
-                "-y",  # Overwrite output file if exists
-                "-i", input_video,
-                "-vn",  # Disable video
-                "-acodec", "libmp3lame",
-                "-q:a", "2",
-                "-id3v2_version", "3",  # Better metadata support
-                output_audio
-            ],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        
-        if os.path.exists(output_audio):
-            print(f"Conversion complete! MP3 saved as: {output_audio}")
-        else:
-            print("Error: MP3 file not created after conversion")
-            print("FFmpeg output:", result.stdout)
-            raise FileNotFoundError("Output MP3 file not found")
-            
-    except subprocess.CalledProcessError as e:
-        print(f"Error converting to MP3: {e.stderr}")
-        raise
+    command.extend(
+        [
+            "-f",
+            AUDIO_ONLY_FORMAT,
+            "-x",
+            "--audio-format",
+            "mp3",
+            "--audio-quality",
+            "2",
+            "--embed-metadata",
+            "--ffmpeg-location",
+            dependencies["ffmpeg_location"],
+            "--continue",
+            "-o",
+            output_template,
+            source_url,
+        ]
+    )
+
+    mode = "playlist" if playlist_mode else "single video"
+    print(f"Downloading {mode} audio and converting to MP3...")
+    print(f"Output folder: {output_dir}")
+
+    subprocess.run(command, check=True)
+
+    print(f"Done. MP3 file(s) saved under: {output_dir}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Download YouTube audio as MP3 without downloading video streams."
+    )
+    parser.add_argument("url", nargs="?", help="YouTube video or playlist URL.")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        help="Directory where MP3 files should be saved. Defaults to this script's folder.",
+    )
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--playlist",
+        action="store_true",
+        help="Download every item in a playlist URL.",
+    )
+    mode.add_argument(
+        "--single",
+        action="store_true",
+        help="Download only the single video, even if the URL contains playlist data.",
+    )
+
+    return parser.parse_args()
+
 
 def main():
     print("Welcome to YouTube to MP3 Converter!")
-    
+
     try:
-        # First check if required programs are available
-        check_dependencies()
-        
-        youtube_url = input("Enter the YouTube URL: ").strip()
-        if not youtube_url:
+        args = parse_args()
+        dependencies = check_dependencies()
+
+        source_url = args.url or input("Enter the YouTube URL: ").strip()
+        if not source_url:
             print("Invalid URL. Please try again.")
             return
 
-        # Get the video title
-        video_title = get_video_title(youtube_url)
-        print(f"Video title: {video_title}")
+        if args.playlist:
+            playlist_mode = True
+        elif args.single:
+            playlist_mode = False
+        else:
+            playlist_mode = looks_like_playlist(source_url)
 
-        # Get the script's directory
-        script_dir = os.path.abspath(os.path.dirname(__file__))
-        
-        # Create absolute paths for output files using the video title
-        output_video = os.path.join(script_dir, f"{video_title}.mp4")
-        output_audio = os.path.join(script_dir, f"{video_title}.mp3")
-        
-        # Print working directory and file paths
-        print(f"\nCurrent working directory: {os.getcwd()}")
-        print(f"Video will be saved to: {output_video}")
-        print(f"Audio will be saved to: {output_audio}\n")
+        script_dir = Path(__file__).resolve().parent
+        output_dir = (
+            Path(args.output_dir).expanduser().resolve()
+            if args.output_dir
+            else script_dir
+        )
 
-        # Step 1: Download the video
-        download_video(youtube_url, output_video)
-        
-        # Step 2: Validate the downloaded video
-        print("Validating downloaded video...")
-        if not is_video_valid(output_video):
-            os.remove(output_video)
-            raise ValueError("Downloaded video file is corrupted or invalid")
-        
-        # Step 3: Convert to MP3
-        convert_to_mp3(output_video, output_audio)
-        
-        # Optional: Remove the video file to save space
-        if os.path.exists(output_video):
-            os.remove(output_video)
-            print(f"Temporary video file {output_video} deleted.")
-            
+        if playlist_mode:
+            print("Playlist mode enabled.")
+        else:
+            print("Single-video mode enabled. Use --playlist to force playlist downloads.")
+
+        download_audio_as_mp3(
+            source_url=source_url,
+            output_dir=output_dir,
+            playlist_mode=playlist_mode,
+            dependencies=dependencies,
+        )
+
     except FileNotFoundError as e:
         print(f"File Error: {e}")
     except EnvironmentError as e:
         print(f"Environment Error: {e}")
+    except subprocess.CalledProcessError as e:
+        print(f"yt-dlp failed with exit code {e.returncode}.")
     except Exception as e:
         print(f"An error occurred: {e}")
         print("Full error details:", str(sys.exc_info()))
+
 
 if __name__ == "__main__":
     main()
