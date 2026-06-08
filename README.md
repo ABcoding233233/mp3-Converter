@@ -93,7 +93,8 @@ Download an entire playlist:
 Mode is chosen automatically when you don't pass `--playlist` or `--single`:
 
 - A dedicated playlist URL (`.../playlist?list=...`) downloads the whole playlist.
-- A normal watch URL is treated as a single video — even if it carries a `list=` parameter (autoplay/radio links), so you don't accidentally pull hundreds of tracks. Pass `--playlist` to force the full list.
+- A watch URL with a normal playlist id (`.../watch?v=...&list=PL...`) downloads the whole playlist.
+- A watch URL with a YouTube mix/radio id (`...&list=RD...`) is treated as a single video so you do not accidentally pull a generated queue. Pass `--playlist` to force the full list.
 
 Save output to a different folder:
 

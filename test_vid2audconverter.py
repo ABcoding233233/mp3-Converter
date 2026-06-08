@@ -12,6 +12,7 @@ from vid2audconverter import (
     SOURCE_FORMATS,
     build_item_command,
     build_yt_dlp_command,
+    fetch_playlist_entries,
     get_item_output_template,
     get_output_template,
     looks_like_playlist,
@@ -31,8 +32,15 @@ def test_bare_playlist_url_is_playlist():
     assert looks_like_playlist("https://www.youtube.com/playlist?list=PL123")
 
 
-def test_watch_url_with_list_is_single():
-    # Autoplay/radio links carry a list= but point at one video.
+def test_watch_url_with_playlist_id_is_playlist():
+    assert looks_like_playlist(
+        "https://www.youtube.com/watch?v=Pi7l8mMjYVE"
+        "&list=PLMrJAkhIeNNR20Mz-VpzgfQs5zrYi085m"
+    )
+
+
+def test_watch_url_with_mix_list_is_single():
+    # Autoplay/radio links carry an RD-style list id but point at one video.
     assert not looks_like_playlist(
         "https://www.youtube.com/watch?v=abc123&list=RD123"
     )
@@ -200,3 +208,24 @@ def test_parse_flat_playlist_output_falls_back_to_raw_url():
     entries, playlist_title = parse_flat_playlist_output(text)
     assert playlist_title == "Playlist"
     assert entries == [(4, "Fourth Song", "https://youtu.be/four")]
+
+
+def test_fetch_playlist_entries_forces_playlist_metadata(monkeypatch):
+    captured = {}
+
+    class FakeResult:
+        stdout = "1\tSong\thttps://youtu.be/abc\tabc\tPlaylist\n"
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return FakeResult()
+
+    monkeypatch.setattr("vid2audconverter.subprocess.run", fake_run)
+
+    entries, playlist_title = fetch_playlist_entries(
+        "https://www.youtube.com/watch?v=abc&list=PL123", FAKE_DEPS
+    )
+
+    assert "--yes-playlist" in captured["command"]
+    assert entries == [(1, "Song", "https://youtu.be/abc")]
+    assert playlist_title == "Playlist"

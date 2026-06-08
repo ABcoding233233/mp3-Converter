@@ -38,6 +38,9 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)")
 # Characters that are not allowed in Windows file/folder names.
 _INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# YouTube generated mixes/radio queues use RD-style list ids. Keep those in
+# single-video mode unless the user explicitly forces playlist mode.
+_YOUTUBE_MIX_PLAYLIST_PREFIXES = ("RD",)
 
 
 def main():
@@ -181,24 +184,23 @@ def resolve_output_dir(args):
 
 
 def looks_like_playlist(source_url):
-    """Return True when the URL points at a playlist, not a single video.
-
-    A bare playlist URL (``/playlist?list=...``) is always treated as a
-    playlist. A normal watch URL that merely carries a ``list=`` parameter
-    (autoplay/radio links, "watch?v=...&list=...") is treated as a single video
-    so Auto mode does not unexpectedly download an entire playlist. Use
-    ``--playlist`` to force playlist mode for those URLs.
-    """
+    """Return True when the URL points at a playlist, not a single video."""
     parsed = urlparse(source_url)
     query = parse_qs(parsed.query)
+    playlist_id = _first_real_value(*query.get("list", []))
+    if not playlist_id:
+        return False
 
     if parsed.path.rstrip("/").endswith("/playlist"):
         return True
 
-    # A watch URL carries a video id (``v=`` on youtube.com, or the path on
-    # youtu.be short links). Those are single videos even when a list= is set.
-    has_video_id = "v" in query or parsed.netloc.endswith("youtu.be")
-    return "list" in query and not has_video_id
+    return not _looks_like_youtube_mix(playlist_id)
+
+
+def _looks_like_youtube_mix(playlist_id):
+    """Return True for generated YouTube mix/radio list ids."""
+    normalized = playlist_id.upper()
+    return normalized.startswith(_YOUTUBE_MIX_PLAYLIST_PREFIXES)
 
 
 def download_audio_as_mp3(
@@ -396,6 +398,7 @@ def fetch_playlist_entries(source_url, dependencies):
     can show every track and download them individually.
     """
     command = list(dependencies["yt_dlp_command"]) + [
+        "--yes-playlist",
         "--flat-playlist",
         "--no-warnings",
         "--print",
