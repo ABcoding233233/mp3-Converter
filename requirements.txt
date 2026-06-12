@@ -1,0 +1,7 @@
+imageio-ffmpeg
+yt-dlp
+pytest
+
+# If a system FFmpeg is available in PATH, the script will use it. Otherwise,
+# imageio-ffmpeg provides a bundled FFmpeg executable for yt-dlp conversion.
+# pytest runs the test suite (test_vid2audconverter.py).
